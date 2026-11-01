@@ -1,3 +1,5 @@
+const quickToken = new URLSearchParams(location.hash.slice(1)).get('connect');
+if(location.hash) history.replaceState(null, '', location.pathname + location.search);
 const $ = id => document.getElementById(id);
 let remoteCursor = null;
 let ws, url, sending = false, generation = 0, latestMove = null;
@@ -13,10 +15,10 @@ async function disconnect() {
   await fetch('/logout', {method:'POST'}).catch(() => {});
   status('Доступ отключён');
 }
-$('form').onsubmit = async e => {
-  e.preventDefault(); const button = e.submitter; button.disabled = true;
+async function connect(endpoint, payload) {
+  const button = $('form').querySelector('button'); button.disabled = true;
   try {
-    const response = await fetch('/login', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:$('password').value})});
+    const response = await fetch(endpoint, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
     if (!response.ok) throw new Error(await response.text());
     $('password').value = ''; const current = ++generation;
     ws = new WebSocket(`wss://${location.host}/stream`); ws.binaryType = 'blob';
@@ -35,6 +37,18 @@ $('form').onsubmit = async e => {
     ws.onerror = () => status('Не удалось подключиться. Проверьте, включён ли доступ.');
   } catch(error) { status(error.message); } finally { button.disabled = false; }
 };
+$('form').onsubmit = e => { e.preventDefault(); connect('/login', {password:$('password').value}); };
+async function quickConnect(token) {
+  if(ws) await disconnect();
+  status('Выполняю быстрый вход…');
+  await connect('/quick-login', {token});
+}
+if(quickToken) quickConnect(quickToken);
+window.addEventListener('hashchange', () => {
+  const token = new URLSearchParams(location.hash.slice(1)).get('connect');
+  if(location.hash) history.replaceState(null, '', location.pathname + location.search);
+  if(token) quickConnect(token);
+});
 $('disconnect').onclick = disconnect;
 $('fullscreen').onclick = () => $('stage').requestFullscreen().catch(error => status(error.message));
 $('control').onchange = () => { release(); $('stage').classList.toggle('active', active()); drawCursor(); status(active() ? 'Подключено · управление включено' : 'Подключено · просмотр экрана'); };

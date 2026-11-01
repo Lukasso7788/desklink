@@ -73,6 +73,22 @@ def main():
             page.locator('#disconnect').click()
             page.locator('#login').wait_for(state='visible')
             page.wait_for_function("() => document.querySelector('#status').textContent === 'Доступ отключён'")
+            from companion import browser_access
+            from cryptography import x509
+            from cryptography.hazmat.primitives import hashes
+            pin = x509.load_pem_x509_certificate((Path(temporary.name)/'identity.pem').read_bytes()).fingerprint(hashes.SHA256()).hex()
+            device = asyncio.run_coroutine_threadsafe(browser_access(f'https://127.0.0.1:{port}', pin, password='browser-test-only'), loop).result(timeout=10)
+            quick_url = asyncio.run_coroutine_threadsafe(browser_access(device['address'], pin, token=device['token']), loop).result(timeout=10)
+            page.goto(quick_url)
+            page.locator('#remote').wait_for(state='visible')
+            assert not page.evaluate('location.hash')
+            assert not page.locator('#control').is_checked()
+            page.locator('#disconnect').click()
+            page.wait_for_function("() => document.querySelector('#status').textContent === 'Доступ отключён'")
+            page.goto(quick_url)
+            page.wait_for_function("() => document.querySelector('#status').textContent.includes('Ссылка истекла')")
+            assert page.locator('#login').is_visible()
+            assert not page.evaluate('location.hash')
             page.set_viewport_size({'width':390,'height':844})
             page.screenshot(path=str(evidence/'browser-mobile.png'))
             assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')

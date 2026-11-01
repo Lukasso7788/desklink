@@ -18,6 +18,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import ttk
+from device_store import DeviceStore
 
 from aiohttp import web, WSMsgType
 from PIL import ImageGrab
@@ -27,7 +28,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 PORT = 47831
-VERSION = '0.2.0'
+VERSION = '0.3.0'
 PROFILES = {'balanced': (1920, 1200, 80), 'sharp': (2560, 1600, 92), 'native': (0, 0, 96)}
 ROOT = Path(getattr(sys, '_MEIPASS', Path(__file__).parent))
 
@@ -201,10 +202,13 @@ def certificate(folder, ips):
 
 
 class Host:
-    def __init__(self, password, report, desktop=None):
+    def __init__(self, password, report, desktop=None, device_store=None):
         self.password, self.report = password, report
         self.desktop = desktop or Desktop()
         self.sessions = {}
+        self.pairing_sessions = set()
+        self.quick_token = None
+        self.device_store = device_store or DeviceStore()
         self.failures = []
         self.ws = None
         self.ws_token = None
@@ -238,6 +242,10 @@ class Host:
             return web.FileResponse(ROOT / 'web' / name)
         app.router.add_get('/', asset)
         app.router.add_post('/login', self.login)
+        app.router.add_post('/quick-login', self.quick_login)
+        app.router.add_post('/pair', self.pair)
+        app.router.add_post('/device-login', self.device_login)
+        app.router.add_post('/browser-link', self.browser_link)
         app.router.add_post('/logout', self.logout)
         app.router.add_get('/stream', self.stream)
         app.router.add_get('/{asset}', asset)
@@ -258,20 +266,85 @@ class Host:
         if not isinstance(supplied, str) or not secrets.compare_digest(supplied.encode(), self.password.encode()):
             self.failures.append(now)
             raise web.HTTPUnauthorized(text='Неверный пароль')
+        return self.new_session(allow_pair=True)
+
+    def new_session(self, allow_pair=False):
+        now = time.monotonic()
         self.sessions = {t: expiry for t, expiry in self.sessions.items() if expiry > now}
+        self.pairing_sessions.intersection_update(self.sessions)
         if len(self.sessions) >= 8:
             raise web.HTTPTooManyRequests(text='Слишком много сеансов')
         token = secrets.token_urlsafe(32)
         self.sessions[token] = now + 3600
+        if allow_pair:
+            self.pairing_sessions.add(token)
         response = web.json_response({'ok': True})
         response.set_cookie('desklink', token, secure=True, httponly=True, samesite='Strict', max_age=3600)
         return response
+
+    async def quick_link(self, address):
+        token = secrets.token_urlsafe(32)
+        self.quick_token = (hashlib.sha256(token.encode()).digest(), time.monotonic() + 300)
+        return address.rstrip('/') + '/#connect=' + token
+
+    async def quick_login(self, request):
+        if not self.same_origin(request):
+            raise web.HTTPForbidden()
+        try:
+            data = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            raise web.HTTPBadRequest(text='Некорректный запрос')
+        token = data.get('token', '') if isinstance(data, dict) else ''
+        expected = self.quick_token
+        if (not isinstance(token, str) or len(token) > 128 or not expected
+                or expected[1] <= time.monotonic()
+                or not secrets.compare_digest(hashlib.sha256(token.encode()).digest(), expected[0])):
+            raise web.HTTPUnauthorized(text='Ссылка истекла или уже использована. Скопируйте новую ссылку на компьютере.')
+        # No await between validating and consuming: concurrent requests cannot reuse a link.
+        response = self.new_session()
+        self.quick_token = None
+        return response
+
+    async def pair(self, request):
+        if (not self.same_origin(request) or not self.valid(request)
+                or request.cookies.get('desklink') not in self.pairing_sessions):
+            raise web.HTTPUnauthorized()
+        try:
+            return web.json_response({'token':self.device_store.issue()})
+        except ValueError as error:
+            raise web.HTTPTooManyRequests(text=str(error))
+
+    async def device_login(self, request):
+        if not self.same_origin(request):
+            raise web.HTTPForbidden()
+        try:
+            data = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            raise web.HTTPBadRequest()
+        if not isinstance(data, dict) or not self.device_store.valid(data.get('token')):
+            raise web.HTTPUnauthorized(text='Привязка истекла или отозвана. Добавьте компьютер заново.')
+        return self.new_session()
+
+    async def browser_link(self, request):
+        if not self.same_origin(request) or not self.valid(request):
+            raise web.HTTPUnauthorized()
+        return web.json_response({'url':await self.quick_link('https://' + request.host)})
+
+    async def revoke_devices(self):
+        self.device_store.revoke()
+        self.sessions.clear()
+        self.pairing_sessions.clear()
+        self.quick_token = None
+        self.desktop.release()
+        if self.ws is not None:
+            await self.ws.close(code=1001, message=b'Devices revoked')
 
     async def logout(self, request):
         if not self.same_origin(request):
             raise web.HTTPForbidden()
         token = request.cookies.get('desklink', '')
         self.sessions.pop(token, None)
+        self.pairing_sessions.discard(token)
         if self.ws is not None and self.ws_token == token:
             self.desktop.release()
             await self.ws.close(code=1000, message=b'Logged out')
@@ -354,6 +427,8 @@ class Host:
 
     async def stop(self):
         self.sessions.clear()
+        self.pairing_sessions.clear()
+        self.quick_token = None
         self.desktop.release()
         if self.ws is not None:
             await self.ws.close(code=1001, message=b'Host stopped')
@@ -366,8 +441,8 @@ class Window:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title('DeskLink ' + VERSION + ' — удалённый доступ')
-        self.root.geometry('720x660')
-        self.root.minsize(680, 520)
+        self.root.geometry('820x700')
+        self.root.minsize(780, 640)
         self.events = queue.Queue()
         self.host = None
         self.thread = None
@@ -378,11 +453,26 @@ class Window:
         frame.pack(fill='both', expand=True)
         ttk.Label(frame, text='DeskLink', font=('Segoe UI', 26, 'bold')).pack(anchor='w')
         ttk.Label(frame, text='Ваш компьютер. Ваш доступ.', font=('Segoe UI', 12)).pack(anchor='w', pady=(0, 18))
-        ttk.Label(frame, text='1. Включите доступ на этом компьютере.\n2. Откройте адрес ниже в браузере ноутбука.\n3. Проверьте сертификат и введите пароль.', justify='left').pack(anchor='w')
+        ttk.Label(frame, text='Включите доступ. Откройте ссылку на ноутбуке или добавьте компьютер в DeskLink Client.', justify='left').pack(anchor='w')
         ttk.Label(frame, text='Пароль (новый при каждом запуске):').pack(anchor='w', pady=(16, 4))
-        self.entry = ttk.Entry(frame, textvariable=self.password, font=('Consolas', 14), state='readonly')
-        self.entry.pack(fill='x')
-        self.info = tk.Text(frame, height=8, wrap='word', font=('Consolas', 10), state='disabled', takefocus=False)
+        password_row = ttk.Frame(frame)
+        password_row.pack(fill='x')
+        self.entry = ttk.Entry(password_row, textvariable=self.password, font=('Consolas', 14), state='readonly')
+        self.entry.pack(side='left', fill='x', expand=True)
+        ttk.Button(password_row, text='Скопировать пароль', command=lambda: self.copy(self.password.get(), 'Пароль скопирован')).pack(side='left', padx=(8, 0))
+        self.address = tk.StringVar()
+        self.addresses = ttk.Combobox(frame, textvariable=self.address, state='disabled')
+        self.addresses.pack(fill='x', pady=(8, 0))
+        quick_row = ttk.Frame(frame)
+        quick_row.pack(fill='x', pady=6)
+        self.copy_address = ttk.Button(quick_row, text='Скопировать адрес', state='disabled', command=lambda: self.copy(self.address.get(), 'Адрес скопирован'))
+        self.copy_address.pack(side='left')
+        self.quick_button = ttk.Button(quick_row, text='Скопировать ссылку для входа', state='disabled', command=self.quick)
+        self.quick_button.pack(side='left', padx=8)
+        self.revoke_button = ttk.Button(quick_row, text='Сбросить привязки', state='disabled', command=self.revoke)
+        self.revoke_button.pack(side='left')
+        ttk.Label(frame, text='Быстрый вход без пароля: одноразовая ссылка на 5 минут. Новая ссылка отменяет предыдущую.').pack(anchor='w')
+        self.info = tk.Text(frame, height=4, wrap='word', font=('Consolas', 10), state='disabled', takefocus=False)
         self.info.pack(fill='both', expand=True, pady=12)
         row = ttk.Frame(frame)
         row.pack(fill='x')
@@ -390,7 +480,7 @@ class Window:
         self.start_button.pack(side='left')
         self.stop_button = ttk.Button(row, text='Остановить доступ', command=self.stop, state='disabled')
         self.stop_button.pack(side='left', padx=10)
-        ttk.Label(frame, textvariable=self.status, font=('Segoe UI', 11, 'bold')).pack(anchor='w', pady=14)
+        ttk.Label(frame, textvariable=self.status, font=('Segoe UI', 11, 'bold'), wraplength=740).pack(anchor='w', pady=14)
         ttk.Label(frame, text='Закрытие окна отключает доступ. Экран: основной монитор.').pack(anchor='w')
         ttk.Label(frame, text='Обновления: HTTPS-адрес файла release.json').pack(anchor='w', pady=(12, 3))
         self.update_url = ttk.Entry(frame)
@@ -400,6 +490,39 @@ class Window:
         self.update_button.pack(anchor='w', pady=6)
         self.root.protocol('WM_DELETE_WINDOW', self.close)
         self.root.after(100, self.poll)
+
+    def copy(self, text, message):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.status.set(message)
+
+    def quick(self):
+        host = self.host
+        if not host or not host.loop or not host.loop.is_running():
+            self.status.set('Сначала включите доступ')
+            return
+        self.quick_button['state'] = 'disabled'
+        future = asyncio.run_coroutine_threadsafe(host.quick_link(self.address.get()), host.loop)
+        def done(result):
+            try:
+                self.events.put(('quick', result.result()))
+            except Exception:
+                self.events.put(('quick-error', 'Не удалось создать ссылку. Включите доступ снова.'))
+        future.add_done_callback(done)
+
+    def revoke(self):
+        from tkinter import messagebox
+        if not self.host or not messagebox.askyesno('Привязки ноутбуков', 'Отключить текущие сеансы и забыть все привязанные ноутбуки?', parent=self.root):
+            return
+        host = self.host
+        future = asyncio.run_coroutine_threadsafe(host.revoke_devices(), host.loop)
+        def done(result):
+            try:
+                result.result()
+                self.events.put(('status', 'Привязки сброшены. Для входа снова потребуется пароль.'))
+            except Exception as error:
+                self.events.put(('status', 'Ошибка сброса: ' + str(error)))
+        future.add_done_callback(done)
 
     def update(self):
         from updater import download_update
@@ -426,14 +549,18 @@ class Window:
                 folder.mkdir(parents=True, exist_ok=True)
                 ips = addresses()
                 ctx, fingerprint = certificate(folder, ips)
-                host = Host(password, lambda message: self.events.put(('status', message)))
+                host = Host(password, lambda message: self.events.put(('status', message)),
+                            device_store=DeviceStore(folder / 'devices.json'))
                 loop.run_until_complete(host.start(ctx))
                 self.host = host
                 self.events.put(('ready', '\n'.join(f'https://{ip}:{PORT}' for ip in ips)
                     + '\n\nSHA-256 сертификата:\n' + fingerprint))
                 loop.run_forever()
             except Exception as error:
-                self.events.put(('error', str(error)))
+                message = ('Другая копия DeskLink уже использует порт 47831. Закройте старое окно и нажмите «Включить доступ» снова.'
+                           if isinstance(error, OSError) and (getattr(error, 'winerror', None) == 10048 or error.errno == 10048)
+                           else str(error))
+                self.events.put(('error', message))
             finally:
                 pending = asyncio.all_tasks(loop)
                 for task in pending:
@@ -447,6 +574,10 @@ class Window:
 
     def stop(self):
         self.stop_button['state'] = 'disabled'
+        self.quick_button['state'] = 'disabled'
+        self.revoke_button['state'] = 'disabled'
+        self.copy_address['state'] = 'disabled'
+        self.addresses['state'] = 'disabled'
         self.status.set('Отключаю доступ…')
         host = self.host
         if host and host.loop and host.loop.is_running():
@@ -464,6 +595,13 @@ class Window:
         while not self.events.empty():
             kind, text = self.events.get()
             if kind == 'ready':
+                urls = [line for line in text.splitlines() if line.startswith('https://')]
+                self.addresses['values'] = urls
+                self.addresses['state'] = 'readonly'
+                self.address.set(next((url for url in urls if '127.0.0.1' not in url), urls[0]))
+                self.quick_button['state'] = 'normal'
+                self.revoke_button['state'] = 'normal'
+                self.copy_address['state'] = 'normal'
                 self.info['state'] = 'normal'
                 self.info.delete('1.0', 'end')
                 self.info.insert('1.0', text)
@@ -474,6 +612,14 @@ class Window:
                     self.stop()
             elif kind == 'status':
                 self.status.set(text)
+            elif kind == 'quick':
+                if self.host and str(self.stop_button['state']) != 'disabled':
+                    self.copy(text, 'Ссылка скопирована. Откройте её на ноутбуке в течение 5 минут.')
+                    self.quick_button['state'] = 'normal'
+            elif kind == 'quick-error':
+                self.status.set(text)
+                if self.host:
+                    self.quick_button['state'] = 'normal'
             elif kind == 'update':
                 self.update_button['state'] = 'normal'
                 self.status.set(text)
@@ -481,6 +627,10 @@ class Window:
                 self.status.set('Ошибка: ' + text)
             elif kind == 'stopped':
                 self.host = None
+                self.revoke_button['state'] = 'disabled'
+                self.quick_button['state'] = 'disabled'
+                self.copy_address['state'] = 'disabled'
+                self.addresses['state'] = 'disabled'
                 self.start_button['state'] = 'normal'
                 self.stop_button['state'] = 'disabled'
                 if not self.status.get().startswith('Ошибка'):

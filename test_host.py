@@ -103,6 +103,57 @@ class Integration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.fingerprint, second)
         self.assertNotIn(b'PRIVATE KEY', (Path(self.temp.name)/'identity.key').read_bytes())
 
+    async def test_quick_link_single_use_expiry_and_revocation(self):
+        link = await self.host.quick_link(self.url)
+        token = link.split('#connect=')[1]
+        self.assertNotIn('test-password', link)
+        r = await self.client.post(self.url+'/quick-login', json={'token':token}, ssl=False)
+        self.assertEqual(r.status, 403)
+        r = await self.client.post(self.url+'/quick-login', json={'token':'wrong'}, headers=self.origin, ssl=False)
+        self.assertEqual(r.status, 401)
+        r = await self.client.post(self.url+'/quick-login', json={'token':token}, headers=self.origin, ssl=False)
+        self.assertEqual(r.status, 200)
+        self.assertTrue(r.cookies['desklink']['secure'])
+        self.assertTrue(r.cookies['desklink']['httponly'])
+        self.assertEqual((await self.client.post(self.url+'/quick-login', json={'token':token}, headers=self.origin, ssl=False)).status, 401)
+        old = (await self.host.quick_link(self.url)).split('#connect=')[1]
+        new = (await self.host.quick_link(self.url)).split('#connect=')[1]
+        self.assertEqual((await self.client.post(self.url+'/quick-login', json={'token':old}, headers=self.origin, ssl=False)).status, 401)
+        self.host.quick_token = (self.host.quick_token[0], 0)
+        self.assertEqual((await self.client.post(self.url+'/quick-login', json={'token':new}, headers=self.origin, ssl=False)).status, 401)
+        await self.host.quick_link(self.url)
+        await self.host.stop()
+        self.assertIsNone(self.host.quick_token)
+
+    async def test_companion_pair_open_pinning_and_revoke(self):
+        from companion import browser_access, fingerprint
+        from device_store import DeviceStore, protect
+        self.host.device_store = DeviceStore(Path(self.temp.name) / 'devices.json')
+        pin = self.fingerprint.replace(':', '').lower()
+        self.assertEqual(await asyncio.to_thread(fingerprint, self.url), pin)
+        device = await browser_access(self.url, pin, password='test-password')
+        self.assertTrue(self.host.device_store.valid(device['token']))
+        stored = DeviceStore(Path(self.temp.name) / 'devices.json')
+        self.assertTrue(stored.valid(device['token']))
+        self.assertNotIn(device['token'], (Path(self.temp.name) / 'devices.json').read_text())
+        encrypted = protect(json.dumps(device).encode())
+        self.assertNotIn(device['token'].encode(), encrypted)
+        self.assertEqual(json.loads(protect(encrypted, True)), device)
+        with self.assertRaises(__import__('aiohttp').ServerFingerprintMismatch):
+            await browser_access(self.url, '00'*32, token=device['token'])
+        link = await browser_access(self.url, pin, token=device['token'])
+        self.assertIn('/#connect=', link)
+        token = link.split('#connect=')[1]
+        response = await self.client.post(self.url+'/quick-login', json={'token':token}, headers=self.origin, ssl=False)
+        self.assertEqual(response.status, 200)
+        # A bearer link grants a browser session, never permission to create a permanent device.
+        response = await self.client.post(self.url+'/pair', headers=self.origin, ssl=False)
+        self.assertEqual(response.status, 401)
+        await self.host.revoke_devices()
+        self.assertFalse(DeviceStore(Path(self.temp.name) / 'devices.json').valid(device['token']))
+        with self.assertRaisesRegex(RuntimeError, 'Привязка истекла'):
+            await browser_access(self.url, pin, token=device['token'])
+
 
 class WindowsCapture(unittest.TestCase):
     def test_real_screen_and_input_layout(self):
