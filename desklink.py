@@ -14,6 +14,7 @@ import secrets
 import socket
 import ssl
 import sys
+import winreg
 import threading
 import time
 import tkinter as tk
@@ -28,7 +29,9 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 PORT = 47831
-VERSION = '0.3.0'
+VERSION = '0.4.0'
+STARTUP_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
+STARTUP_NAME = 'DeskLink Host'
 PROFILES = {'balanced': (1920, 1200, 80), 'sharp': (2560, 1600, 92), 'native': (0, 0, 96)}
 ROOT = Path(getattr(sys, '_MEIPASS', Path(__file__).parent))
 
@@ -482,6 +485,15 @@ class Window:
         self.stop_button.pack(side='left', padx=10)
         ttk.Label(frame, textvariable=self.status, font=('Segoe UI', 11, 'bold'), wraplength=740).pack(anchor='w', pady=14)
         ttk.Label(frame, text='Закрытие окна отключает доступ. Экран: основной монитор.').pack(anchor='w')
+        self.autostart = tk.BooleanVar(value=False)
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_KEY) as key:
+                winreg.QueryValueEx(key, STARTUP_NAME)
+                self.autostart.set(True)
+        except FileNotFoundError:
+            pass
+        ttk.Checkbutton(frame, text='Включать доступ при входе в Windows',
+                        variable=self.autostart, command=self.save_autostart).pack(anchor='w')
         ttk.Label(frame, text='Обновления: HTTPS-адрес файла release.json').pack(anchor='w', pady=(12, 3))
         self.update_url = ttk.Entry(frame)
         self.update_url.insert(0, 'https://github.com/lukasso7788/desklink/releases/latest/download/release.json')
@@ -537,7 +549,30 @@ class Window:
                 self.events.put(('update', 'Обновление: ' + str(error)))
         threading.Thread(target=worker, daemon=True).start()
 
+    def save_autostart(self):
+        enabled = self.autostart.get()
+        try:
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, STARTUP_KEY) as key:
+                if enabled:
+                    command = f'"{sys.executable}" --start-access'
+                    if not getattr(sys, 'frozen', False):
+                        command = f'"{sys.executable}" "{Path(__file__).resolve()}" --start-access'
+                    winreg.SetValueEx(key, STARTUP_NAME, 0, winreg.REG_SZ, command)
+                else:
+                    try:
+                        winreg.DeleteValue(key, STARTUP_NAME)
+                    except FileNotFoundError:
+                        pass
+        except OSError as error:
+            self.autostart.set(not enabled)
+            self.status.set('Ошибка настройки автозапуска: ' + str(error))
+            return
+        if enabled and str(self.start_button['state']) != 'disabled':
+            self.start()
+
     def start(self):
+        if str(self.start_button['state']) == 'disabled':
+            return
         self.start_button['state'] = 'disabled'
         password = self.password.get()
         self.status.set('Запускаю защищённое подключение…')
@@ -647,4 +682,7 @@ if __name__ == '__main__':
         C.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
         C.windll.user32.SetProcessDPIAware()
-    Window().root.mainloop()
+    window = Window()
+    if '--start-access' in sys.argv and window.autostart.get():
+        window.root.after(0, window.start)
+    window.root.mainloop()

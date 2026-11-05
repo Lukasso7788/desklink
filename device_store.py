@@ -37,7 +37,8 @@ class DeviceStore:
             self.devices = data
 
     def save(self):
-        self.devices = {key:expiry for key, expiry in self.devices.items() if expiry > time.time()}
+        self.devices = {key:expiry for key, expiry in self.devices.items()
+                        if expiry is None or expiry > time.time()}
         if self.path:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.path.with_suffix('.tmp')
@@ -49,13 +50,26 @@ class DeviceStore:
         if len(self.devices) >= 10:
             raise ValueError('Слишком много привязанных ноутбуков. Сбросьте привязки на компьютере.')
         token = secrets.token_urlsafe(32)
-        self.devices[hashlib.sha256(token.encode()).hexdigest()] = time.time() + 90*86400
+        self.devices[hashlib.sha256(token.encode()).hexdigest()] = None
         self.save()
         return token
 
     def valid(self, token):
-        return (isinstance(token, str) and 20 <= len(token) <= 128 and
-            self.devices.get(hashlib.sha256(token.encode()).hexdigest(), 0) > time.time())
+        if not isinstance(token, str) or not 20 <= len(token) <= 128:
+            return False
+        key = hashlib.sha256(token.encode()).hexdigest()
+        expiry = self.devices.get(key, 0)
+        if expiry is None:
+            return True
+        if expiry <= time.time():
+            return False
+        self.devices[key] = None
+        try:
+            self.save()
+        except OSError:
+            self.devices[key] = expiry
+            raise
+        return True
 
     def revoke(self):
         self.devices.clear()
